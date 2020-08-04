@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+
+# landscape-sysinfo-centos
+# https://github.com/alct/landscape-sysinfo-centos
+
+add_leading_zero_if_missing() {
+  local value="${1}"
+
+  [[ "${value}" =~ ^\.[0-9]+$ ]] && value="0${value}"
+  echo "${value}"
+}
+
+keep_two_decimal() {
+  local value="${1}"
+
+  [[ "${value}" =~ \. ]] && value="$(grep --perl-regexp --only-matching "[0-9]+\.[0-9]{2}" <<< "${value}")"
+
+  echo "${value}"
+}
+
+percentage() {
+  local value="${1}"
+  local total="${2}"
+
+  [[ "${value}" =~ ^([0-9]+\.)?[0-9]+$ ]] || return 1
+  [[ "${total}" =~ ^([0-9]+\.)?[0-9]+$ ]] || return 1
+
+  awk -v value="${value}" -v total="${total}" 'BEGIN{print value / total * 100}'
+}
+
+ram_usage() {
+  local ram_used
+  local ram_total
+  local ram_total_human
+  local pct_used
+  local data
+
+  data="$(free | grep "Mem:")"
+
+  ram_used="$(awk '{print $3}' <<< "${data}")"
+  ram_total="$(awk '{print $2}' <<< "${data}")"
+  ram_total_human="$(free --human --si | grep "Mem:" | awk '{print $2}')"
+
+  pct_used="$(percentage "${ram_used}" "${ram_total}")"
+  pct_used="$(keep_two_decimal "$(add_leading_zero_if_missing "${pct_used}")")"
+
+  echo "${pct_used}% of ${ram_total_human}"
+}
+
+swap_usage() {
+  local swap_used
+  local swap_total
+  local swap_total_human
+  local pct_used
+  local data
+
+  data="$(free | grep "Swap:")"
+
+  swap_used="$(awk '{print $3}' <<< "${data}")"
+  swap_total="$(awk '{print $2}' <<< "${data}")"
+  swap_total_human="$(free --human --si | grep "Swap:" | awk '{print $2}')"
+
+  if [[ "${swap_total_human}" != "0B" ]]; then
+    pct_used="$(percentage "${swap_used}" "${swap_total}")"
+    pct_used="$(keep_two_decimal "$(add_leading_zero_if_missing "${pct_used}")")"
+
+    echo "${pct_used}% of ${swap_total_human}"
+    return
+  fi
+
+  echo "-"
+}
+
+disk_usage() {
+  local disk_pct
+  local disk_used
+  local disk_total
+  local data
+
+  data="$(df --human-readable / | tail -n +2)"
+
+  disk_total="$(awk '{print $2}' <<< "${data}")"
+  disk_used="$(awk '{print $3}' <<< "${data}")"
+  disk_pct="$(awk '{print $5}' <<< "${data}")"
+
+  echo "${disk_pct} of ${disk_total} (${disk_used})"
+}
+
+processes() {
+  ps -A --no-headers | wc -l
+}
+
+system_load() {
+  awk '{print $1}' < "/proc/loadavg"
+}
+
+network() {
+  local name
+  local ip4
+  local ip6
+  local ips
+  local interface
+  local interfaces
+
+  interfaces="$(ip -oneline address | grep "brd" | grep --perl-regexp "inet6?")"
+
+  while read -r interface; do
+    name="$(awk '{print $2}' <<< "${interface}")"
+    ip4="$(grep --perl-regexp --only-matching "(?<=inet )[^ ]+" <<< "${interface}")"
+    ip6="$(grep --perl-regexp --only-matching "(?<=inet6 )[^ ]+" <<< "${interface}")"
+    ips="${ip4%%/*}, ${ip6%%/*}"
+
+    echo "  IP address for ${name}:|${ips%%", "}"
+  done <<< "${interfaces}"
+}
+
+logged_in_users() {
+  local user
+  local users
+  local user_list
+  local user_current
+  local count
+
+  user_current="$(awk '{print $1}' <<< "${SSH_CLIENT}"):$(awk '{print $2}' <<< "${SSH_CLIENT}")"
+  users="$(ss --no-header state established '( sport = :ssh )' | awk '{print $5}')"
+  count="$(grep -vc "^$" <<< "${users}")"
+
+  while read -r user; do
+    if [[ "${user}" =~ [0-9]+ ]]; then
+      [[ "${user}" != "${user_current}" ]] && user="\033[0;31m${user}\033[0m"
+
+      user_list="${user_list}, ${user}"
+    fi
+  done <<< "${users}"
+
+  (( count > 0 )) && user_list="(${user_list##", "})"
+
+  echo "${count} ${user_list}"
+}
+
+uptime() {
+  local uptime
+  local mins
+  local hours
+  local days
+
+  if [[ -f "/proc/uptime" ]]; then
+    uptime="$(< "/proc/uptime")"
+    uptime="${uptime//.*}"
+  fi
+
+  if [[ -n "${uptime}" ]]; then
+    mins="$((uptime / 60 % 60))"
+    hours="$((uptime / 3600 % 24))"
+    days="$((uptime / 86400))"
+
+    uptime="${mins}m"
+
+    (( hours != 0 )) && uptime="${hours}h ${uptime}"
+    (( days != 0 )) && uptime="${days}d ${uptime}"
+  fi
+
+  echo "${uptime}"
+}
+
+health_check() {
+  local cores
+  local threshold
+  local system_load
+
+  cores="$(grep --count ^processor "/proc/cpuinfo" 2> "/dev/null")"
+
+  (( cores > 0 )) || cores="1"
+
+  system_load="$(system_load)"
+  threshold="${cores}.0"
+
+  if awk -v system_load="${system_load}" -v threshold="${threshold}" 'BEGIN{exit !(system_load > threshold)}'; then
+    printf "  Information disabled due to high system load (%s/%s)\n\n" "${system_load}" "${threshold}"
+    exit 1
+  fi
+}
+
+datetime() {
+  printf "\n  System information as of %s\n\n" "$(/bin/date --utc)"
+}
+
+sysinfo_template() {
+  printf "  Uptime: %s\n\n" "$(uptime)"
+
+  template="$(column -t -s "|" <<< "
+  Usage of /:   $(disk_usage)|Processes:   $(processes)
+  Memory usage: $(ram_usage) |System load: $(system_load)
+  Swap usage:   $(swap_usage)|SSH session: $(logged_in_users)")"
+
+  echo -e "${template}"
+  echo
+
+  network | column -t -s "|"
+  echo
+}
+
+main() {
+  datetime
+  health_check
+  sysinfo_template
+}
+
+main
